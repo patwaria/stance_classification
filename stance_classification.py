@@ -7,6 +7,7 @@ import sys
 import string
 import nltk
 import pprint
+from scipy.sparse import csr_matrix
 
 from sklearn.feature_extraction import DictVectorizer
 from sklearn.metrics import classification_report
@@ -131,8 +132,7 @@ def extract_individual_features(data):
                 features.update({('sentiment_value', ):polarity, ('subjectivity_value', ): subjectivity,
                                  ('rebuttal_value', ): reb})
 
-                pid = data[c][i]['meta']['pid']
-
+                # pid = data[c][i]['meta']['pid']
                 data[c][i]['features'] = features
                 # prettyPrint(features)
     return data
@@ -173,12 +173,15 @@ def read_data(type):
                 # deppath = filename + '.dep'
                 # with open (deppath, 'w') as f:
                 #     json.dump(data[c][i]['dependencies'],f)
+                # with open (deppath, 'r') as f:
+                #     data[c][i]['dependencies'] = json.load(f)
+
 
                 unigrams.extend(data[c][i]['unigrams'])
                 bigrams.extend(data[c][i]['bigrams'])
                 # dependecies.extend(data[c][i]['dependencies'])
 
-        # data[c]['sequences'] = gen_sequences(data[c])
+        data[c]['sequences'] = gen_sequences(data[c])
         data['unigram_model'] = create_model(unigrams, maxfeat=5000, minfreq=3)
         data['bigram_model'] = create_model(bigrams, maxfeat=5000, minfreq=3)
         # data['dependencies'] = create_model(dependecies, maxfeat=5000, minfreq=3)
@@ -226,15 +229,30 @@ def gen_sequences(thread):
 
 
 def read_authors(type):
-    return None
+    datapath = '../data/authors/' + type + '/'
+    authors = defaultdict(list)
+    for c in string.ascii_uppercase:
+        filename = datapath + c + '.author'
+        # print(filename)
+        lines = read_file(filename)
+        if lines == None: continue
+        for line in lines:
+            line = line.strip('\n')
+            line = line.split(" ")
+            id, author = line[0], line[1]
+            authors[author].append(id)
 
+    # prettyPrint(authors)
+    return authors
 
 def read_folds(type):
+
     datapath = '../data/folds/' + type + '_folds/'
     folds = []
     for i in range(1, 6):
         filepath = datapath + 'Fold-' + str(i)
         fold = read_file(filepath)
+        fold = [f.strip('\n') for f in fold]
         folds.append(fold)
 
     return folds
@@ -246,27 +264,138 @@ def parse_filename(name):
     ind = int(name[1:])
     return (c, ind)
 
-def prev_svm_hmm_datfiles():
+def prep_svm_struct_datfiles(type, data, folds, test_fold = 1):
 
-    return None
-
-def test_classify(data, folds):
-
-    train_folds = [0, 4, 2, 3]
-    test_folds = [1]
+    print ('Prepping type ' + type + '...')
 
     X_train = []
     y_train = []
     X_test = []
     y_test = []
 
-    for i in train_folds:
+    train_seqid = []
+    test_seqid = []
+    train_file_id = []
+    test_file_id = []
+    seqid = 0
+    for c in string.ascii_uppercase:
+        sequences = data[c]['sequences']
+        # if root is in test then whole sequence in test
+        for seq in sequences:
+            seqid += 1
+            # print (len(seq))
+            start = c + str(seq[0])
+            # print (start)
+            test = False
+            if start in folds[test_fold]:
+                test = True
+                # print ("Found in test")
+            for id in seq:
+                stance = data[c][id]['meta']['stance']
+                if stance == -1:
+                    stance = 2
+                if test == False:
+                    X_train.append(data[c][id]['features'])
+                    y_train.append(stance)
+                    train_seqid.append(seqid)
+                    train_file_id.append(c + str(id))
+                else:
+                    X_test.append(data[c][id]['features'])
+                    y_test.append(stance)
+                    test_seqid.append((seqid))
+                    test_file_id.append(c + str(id))
+
+    vectorizer = DictVectorizer(sparse=False)
+    X_train = vectorizer.fit_transform(X_train)
+    X_test = vectorizer.fit_transform(X_test)
+
+    # print (X_train.nonzero())
+    row, col = X_train.nonzero()
+    with open(type + '_train.dat', 'w') as f:
+
+        for i in range(len(X_train)):
+            line = ""
+            line += str(y_train[i]) # stance class
+            line += ' qid:' + str(train_seqid[i])
+            for j in range(len(X_train[i])):
+                if X_train[i][j] != 0:
+                    line += " " + str(j + 1) + ":" + str(X_train[i][j])
+            f.write(line+'\n')
+
+    with open(type + '_test.dat', 'w') as f:
+        for i in range(len(X_test)):
+            line = ""
+            line += str(y_test[i]) # stance class
+            line += ' qid:' + str(test_seqid[i])
+            for j in range(len(X_test[i])):
+                if X_test[i][j] != 0:
+                    line += " " + str(j + 1) + ":" + str(X_test[i][j])
+            f.write(line + '\n')
+
+    # print (X_test.nonzero())
+    print ("Done")
+    return (test_file_id, y_test)
+
+import subprocess
+def run_process(args):
+    fnull = open(os.devnull, 'w')
+    subprocess.call(args, stdout=fnull, stderr=fnull, shell=False)
+
+def learn_classify_svm_structured(type, c, e, test_file_id, y_true):
+
+    args = "svm_hmm_learn.exe -c " + str(c) + " -e 0.5 " + type + "_train.dat " + type + ".model"
+    run_process(args)
+
+    args = "svm_hmm_classify.exe " + type + "_test.dat " + type + ".model " + type + "_output"
+    run_process(args)
+
+
+    lines = read_file(type + "_output")
+
+    test_ids = {}
+    for i, id in enumerate(test_file_id):
+        if id in test_ids: continue
+        test_ids[id] = {}
+        test_ids[id]['1'] = 0
+        test_ids[id]['2'] = 0
+        test_ids[id]['true'] = y_true[i]
+        test_ids[id]['pred'] = -1
+
+    for i, line in enumerate(lines):
+        res = line.strip('\n')
+        test_ids[test_file_id[i]][res] += 1
+
+    correct = 0.0
+    for id in test_ids:
+        pred = 2
+        if test_ids[id]['1'] > test_ids[id]['2']:
+            pred = 1
+        if pred == test_ids[id]['true']:
+            correct += 1.0
+        test_ids[id]['pred'] = pred
+
+    accuracy = correct / len(test_ids)
+    # print ('SSVM Accuracy: ', accuracy)
+    return test_ids, accuracy
+
+def learn_classify__svm_individual(data, folds, test_fold=4):
+
+    test_folds = [0, 1, 2, 3, 4]
+
+    X_train = []
+    y_train = []
+    X_test = []
+    y_test = []
+
+    for i in test_folds:
+        if i == test_fold: continue
         for name in folds[i]:
             c, ind = parse_filename(name)
             X_train.append(data[c][ind]['features'])
             y_train.append(data[c][ind]['meta']['stance'])
 
     for i in test_folds:
+        if i != test_fold: continue
         for name in folds[i]:
             c, ind = parse_filename(name)
             X_test.append(data[c][ind]['features'])
@@ -280,19 +409,63 @@ def test_classify(data, folds):
     clf.fit(X_train, y_train)
 
     y_pred = clf.predict(X_test)
-    return classification_report(y_test, y_pred), accuracy_score(y_test, y_pred)
+    return accuracy_score(y_test, y_pred)
+
+def author_constraint_results(authors, test_ids):
+
+    correct = 0.0
+    for a in authors:
+        ids = authors[a]
+        stance1 = 0; stance2 = 0
+        for id in ids:
+            if id in test_ids:
+                if test_ids[id]['pred'] == 1:
+                    stance1 += 1
+                else:
+                    stance2 += 1
+
+        res = 1
+        if stance2 > stance1:
+            res = 2
+        for id in ids:
+            if id in test_ids:
+                if test_ids[id]['true'] == res:
+                    correct += 1.0
+
+    accuracy = correct / (len(test_ids))
+    # print('SSVM + AC Accuracy: ', accuracy)
+    return accuracy
 
 
 def main():
     types = ['abortion', 'gayRights', 'marijuana', 'obama']
 
+
     for type in types:
+        # if type != 'abortion': continue
 
         print ('--------- ' + type+  ' --------------')
         data = read_data(type)
         data = extract_individual_features(data)
         folds = read_folds(type)
-        prettyPrint (test_classify(data, folds))
+        authors = read_authors(type)
+        test_folds = [0, 1, 2, 3, 4]
+        for test_fold in test_folds:
+            print ('Fold', test_fold)
+            svmacc = learn_classify__svm_individual(data,folds, test_fold)
+            print("SVM: ", svmacc)
+            test_file, y_true = prep_svm_struct_datfiles(type, data, folds, test_fold)
+
+            maxauthacc = 0.0; maxssvmacc = 0.0
+            for c in range(1, 10, 1):
+                # print ('C: ' , c)
+                test_ids, ssvm_acc = learn_classify_svm_structured(type, c, 0.5, test_file, y_true)
+                auth_acc = author_constraint_results(authors, test_ids)
+                if auth_acc > maxauthacc:
+                    maxauthacc = auth_acc
+                    maxssvmacc = ssvm_acc
+            print("SSVM: ", maxssvmacc)
+            print("SSVM+Auth: ", maxauthacc)
 
 
 if __name__ == '__main__':
